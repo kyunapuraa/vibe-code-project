@@ -14,6 +14,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from dotenv import load_dotenv
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "ml"))
 import ml
 from db import add_task, get_active_tasks, init_db, mark_done
 from keyboards import confirmation_keyboard
