@@ -1,7 +1,3 @@
-faster-whisper>=1.0.0
-dateparser>=1.2.0
-pymorphy3>=2.0.0
-pymorphy3-dicts-ru
-python-dotenv>=1.0.0
-requests>=2.31.0
-pytest>=8.0.0
+sentence-transformers>=3.0
+numpy
+pytest
