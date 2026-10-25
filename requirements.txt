@@ -4,3 +4,6 @@ pytesseract
 pillow
 pdf2image
 pytest
+ultralytics
+sentence-transformers
+numpy

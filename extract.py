@@ -97,7 +97,7 @@ def merge_small(chunks, min_len=MIN_LEN):
     return merged
 
 
-def extract(path):
+def extract(path, with_vision=False):
     source = os.path.basename(path)
     result = []
     for page, raw in read_pages(path):
@@ -105,6 +105,11 @@ def extract(path):
         for chunk in chunks:
             if len(chunk) > 40:
                 result.append({"text": chunk, "source": source, "page": page})
+    if with_vision and os.path.splitext(path)[1].lower() in IMAGE_EXT:
+        from vision import describe
+        labels = describe(path)
+        if labels:
+            result.append({"text": "На изображении: " + ", ".join(labels), "source": source, "page": 1})
     return result
 
 
