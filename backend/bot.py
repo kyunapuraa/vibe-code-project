@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -14,11 +15,20 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from dotenv import load_dotenv
 
-import sys
-from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "ml"))
+
+import knowledge
 import ml
-from db import add_task, get_active_tasks, init_db, mark_done
+from db import (
+    add_document,
+    add_task,
+    delete_document,
+    get_active_tasks,
+    get_documents,
+    get_user_chunks,
+    init_db,
+    mark_done,
+)
 from keyboards import confirmation_keyboard
 
 
@@ -142,7 +152,13 @@ async def start(message: Message) -> None:
         "или голосовым. Я предложу название, дедлайн и приоритет. "
         "Проверьте их и подтвердите сохранение.\n\n"
         "/tasks — список активных задач\n"
-        "/done ID — отметить задачу выполненной"
+        "/done ID — отметить задачу выполненной\n\n"
+        "База знаний:\n"
+        "• пришлите файл (PDF, DOCX, TXT, MD) или фото конспекта — я сохраню его\n"
+        "/note текст — сохранить текст как заметку\n"
+        "/ask вопрос — найти нужный фрагмент в ваших материалах\n"
+        "/docs — список сохранённых материалов\n"
+        "/forget ID — удалить материал"
     )
 
 
@@ -229,6 +245,202 @@ async def handle_voice(message: Message, bot: Bot) -> None:
                 Path(temp_path).unlink(missing_ok=True)
             except OSError:
                 logger.warning("Не удалось удалить временный файл %s", temp_path)
+
+
+MAX_FILE_SIZE = 20 * 1024 * 1024
+SNIPPET_LEN = 150
+
+
+async def save_records(
+    message: Message,
+    user_id: int,
+    source: str,
+    kind: str,
+    records: list[dict[str, Any]],
+) -> None:
+    if not records:
+        await message.answer(
+            "Не нашёл в материале текста для сохранения. "
+            "Проверьте файл или пришлите текст через /note."
+        )
+        return
+
+    document_id = await add_document(user_id, source, kind, records)
+    await message.answer(
+        f"Сохранил «{source}» (#{document_id}): {len(records)} фрагм. текста.\n"
+        "Теперь можно искать по нему: /ask ваш вопрос"
+    )
+
+
+async def index_telegram_file(
+    message: Message,
+    bot: Bot,
+    file_id: str,
+    source: str,
+    suffix: str,
+) -> None:
+    temp_path: str | None = None
+    status = await message.answer("Обрабатываю материал, это может занять немного времени…")
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix="telegram_doc_",
+            suffix=suffix,
+            delete=False,
+        ) as temp_file:
+            temp_path = temp_file.name
+
+        await bot.download(file_id, destination=temp_path)
+        records = await asyncio.to_thread(knowledge.index_file, temp_path, source)
+        await save_records(message, message.from_user.id, source, "file", records)
+
+    except ValueError as error:
+        await message.answer(f"Не получилось обработать файл: {error}")
+
+    except Exception:
+        logger.exception("Не удалось проиндексировать файл %s", source)
+        await message.answer(
+            "Не удалось обработать файл. Для PDF-сканов и фото нужно "
+            "распознавание текста (Tesseract) на сервере; можно прислать текст через /note."
+        )
+
+    finally:
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        if temp_path:
+            try:
+                Path(temp_path).unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Не удалось удалить временный файл %s", temp_path)
+
+
+@dp.message(F.document)
+async def handle_document(message: Message, bot: Bot) -> None:
+    document = message.document
+    name = document.file_name or "документ"
+    suffix = Path(name).suffix.lower()
+
+    if suffix not in knowledge.SUPPORTED_EXT:
+        await message.answer(
+            "Этот формат пока не поддерживается. "
+            "Подходят: " + ", ".join(knowledge.SUPPORTED_EXT)
+        )
+        return
+
+    if document.file_size and document.file_size > MAX_FILE_SIZE:
+        await message.answer("Файл больше 20 МБ, Telegram не даёт боту его скачать.")
+        return
+
+    await index_telegram_file(message, bot, document.file_id, name, suffix)
+
+
+@dp.message(F.photo)
+async def handle_photo(message: Message, bot: Bot) -> None:
+    photo = message.photo[-1]
+    source = message.caption.strip() if message.caption else (
+        "Фото от " + datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y %H:%M")
+    )
+    await index_telegram_file(message, bot, photo.file_id, source, ".jpg")
+
+
+@dp.message(Command("note"))
+async def save_note(message: Message) -> None:
+    parts = (message.text or "").split(maxsplit=1)
+
+    if len(parts) != 2 or not parts[1].strip():
+        await message.answer("Напишите текст после команды: /note Матрица — это таблица чисел…")
+        return
+
+    text = parts[1].strip()
+    first_line = text.splitlines()[0]
+    source = first_line[:40] + ("…" if len(first_line) > 40 else "")
+
+    try:
+        records = await asyncio.to_thread(knowledge.index_text, text, source)
+        await save_records(message, message.from_user.id, source, "note", records)
+    except Exception:
+        logger.exception("Не удалось сохранить заметку")
+        await message.answer("Не удалось сохранить заметку. Попробуйте ещё раз.")
+
+
+def format_source(item: dict[str, Any]) -> str:
+    source = item.get("source") or "материал"
+    page = item.get("page")
+    return f"«{source}», стр. {page}" if page and page > 1 else f"«{source}»"
+
+
+@dp.message(Command("ask", "search"))
+async def ask(message: Message) -> None:
+    parts = (message.text or "").split(maxsplit=1)
+
+    if len(parts) != 2 or not parts[1].strip():
+        await message.answer("Напишите вопрос после команды: /ask где я изучал матрицы")
+        return
+
+    query = parts[1].strip()
+    rows = await get_user_chunks(message.from_user.id)
+
+    if not rows:
+        await message.answer(
+            "У вас пока нет сохранённых материалов. "
+            "Пришлите файл или фото конспекта, либо текст через /note."
+        )
+        return
+
+    try:
+        top = await asyncio.to_thread(knowledge.find, query, rows, 3)
+    except Exception:
+        logger.exception("Ошибка поиска")
+        top = []
+
+    if not top:
+        await message.answer("Не удалось ничего найти. Попробуйте переформулировать вопрос.")
+        return
+
+    best = top[0]
+    lines = [f"Нашёл в {format_source(best)}:", "", best["text"]]
+
+    others = top[1:]
+    if others:
+        lines += ["", "Ещё похоже:"]
+        for item in others:
+            snippet = item["text"][:SNIPPET_LEN]
+            if len(item["text"]) > SNIPPET_LEN:
+                snippet += "…"
+            lines.append(f"• {format_source(item)}: {snippet}")
+
+    await message.answer("\n".join(lines)[:4000])
+
+
+@dp.message(Command("docs"))
+async def show_documents(message: Message) -> None:
+    documents = await get_documents(message.from_user.id)
+
+    if not documents:
+        await message.answer("Сохранённых материалов пока нет.")
+        return
+
+    lines = ["Ваши материалы:"]
+    for doc in documents:
+        lines.append(f"#{doc['id']} · {doc['source']} · фрагментов: {doc['chunks']}")
+    lines.append("\nУдалить: /forget ID")
+    await message.answer("\n".join(lines))
+
+
+@dp.message(Command("forget"))
+async def forget_document(message: Message) -> None:
+    parts = (message.text or "").split(maxsplit=1)
+
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Укажите номер материала: /forget ID. Номера — в /docs.")
+        return
+
+    deleted = await delete_document(int(parts[1]), message.from_user.id)
+    await message.answer(
+        f"Материал #{parts[1]} удалён." if deleted else "Материал с таким номером не найден."
+    )
 
 
 @dp.message(F.text & ~F.text.startswith("/"))
@@ -352,6 +564,7 @@ async def main() -> None:
         )
 
     scheduler.start()
+    asyncio.get_running_loop().run_in_executor(None, knowledge.warmup)
 
     try:
         logger.info("Бот запущен; часовой пояс: Europe/Moscow")

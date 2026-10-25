@@ -7,3 +7,8 @@ requests>=2.31.0
 sentence-transformers>=3.0
 numpy
 pytest>=8.0.0
+pypdf
+python-docx
+pytesseract
+pillow
+pdf2image
